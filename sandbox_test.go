@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/mkke/seatbelt"
 )
 
 // helperResult is the JSON output from the sandbox_helper binary.
@@ -59,9 +61,7 @@ func buildHelper(t *testing.T) string {
 	return helperBinary
 }
 
-// projectRoot returns the root of the seatbelt project.
 func projectRoot() string {
-	// Walk up from the test file to find go.mod.
 	dir, _ := os.Getwd()
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
@@ -75,84 +75,35 @@ func projectRoot() string {
 	}
 }
 
-// sbProfile generates an SBPL profile string from the given allow rules.
-// It always starts with (version 1)(deny default) and imports bsd.sb.
-// The helper binary rules are injected later by runSandboxed().
-func sbProfile(rules ...string) string {
-	var sb strings.Builder
-	sb.WriteString("(version 1)\n")
-	sb.WriteString("(deny default)\n")
-	sb.WriteString("(import \"bsd.sb\")\n")
-	// Allow minimum operations for Go runtime.
-	sb.WriteString("(allow process-fork)\n")
-	sb.WriteString("(allow signal)\n")
-	sb.WriteString("(allow sysctl-read)\n")
-	sb.WriteString("(allow mach-lookup (global-name \"com.apple.trustd.agent\"))\n")
-	sb.WriteString("(allow mach-lookup (global-name \"com.apple.SystemConfiguration.configd\"))\n")
-	sb.WriteString("(allow ipc-posix-sem)\n")
+// buildProfile builds an SBPL profile from seatbelt rules, automatically
+// adding rules for the helper binary to execute.
+func buildProfile(t *testing.T, rules ...seatbelt.Rule) string {
+	t.Helper()
+	binary := buildHelper(t)
+	helperDir := filepath.Dir(binary)
 
-	// Allow reading system libraries and frameworks needed by any Go binary.
-	sb.WriteString("(allow file-read* file-read-metadata (subpath \"/usr/lib\"))\n")
-	sb.WriteString("(allow file-read* file-read-metadata (subpath \"/usr/share\"))\n")
-	sb.WriteString("(allow file-read* file-read-metadata (subpath \"/System/Library\"))\n")
-	sb.WriteString("(allow file-read* file-read-metadata (subpath \"/Library/Preferences\"))\n")
-	sb.WriteString("(allow file-read* file-read-metadata (literal \"/dev/null\"))\n")
-	sb.WriteString("(allow file-read* file-read-metadata (literal \"/dev/urandom\"))\n")
-
-	for _, r := range rules {
-		sb.WriteString(r)
-		sb.WriteString("\n")
+	// Build the helper access rules.
+	helperAccess := []seatbelt.Rule{
+		seatbelt.AllowExec(helperDir),
+		seatbelt.ReadWrite(helperDir),
+		// System libraries needed by any Go binary.
+		seatbelt.ReadOnly("/usr/lib", "/usr/share", "/System/Library", "/Library/Preferences"),
+		seatbelt.Custom(`(allow file-read* file-read-metadata (literal "/dev/null"))`),
+		seatbelt.Custom(`(allow file-read* file-read-metadata (literal "/dev/urandom"))`),
 	}
-	return sb.String()
+
+	all := append(helperAccess, rules...)
+	profile, err := seatbelt.BuildProfile(all...)
+	if err != nil {
+		t.Fatalf("BuildProfile: %v", err)
+	}
+	return profile.String()
 }
 
-// helperRules returns SBPL rules to allow the helper binary to execute.
-// Only grants access to the specific helper binary directory, not the
-// entire temp dir, so that denial tests for other temp dirs still work.
-// Must be called after buildHelper().
-func helperRules() string {
-	var sb strings.Builder
-	if helperBinary != "" {
-		helperDir := filepath.Dir(helperBinary)
-		sb.WriteString(fmt.Sprintf("(allow process-exec (subpath \"%s\"))\n", helperDir))
-		sb.WriteString(fmt.Sprintf("(allow file-read* file-write* file-read-metadata (subpath \"%s\"))\n", helperDir))
-		if resolved, err := filepath.EvalSymlinks(helperDir); err == nil && resolved != helperDir {
-			sb.WriteString(fmt.Sprintf("(allow process-exec (subpath \"%s\"))\n", resolved))
-			sb.WriteString(fmt.Sprintf("(allow file-read* file-write* file-read-metadata (subpath \"%s\"))\n", resolved))
-		}
-	}
-	return sb.String()
-}
-
-// resolvedPath returns both the original and EvalSymlinks-resolved path
-// as an SBPL (require-any (subpath ...) (subpath ...)) expression, or
-// just (subpath ...) if they are the same.
-func resolvedSubpath(path string) string {
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil || resolved == path {
-		return fmt.Sprintf(`(subpath "%s")`, path)
-	}
-	return fmt.Sprintf(`(require-any (subpath "%s") (subpath "%s"))`, path, resolved)
-}
-
-func resolvedLiteral(path string) string {
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil || resolved == path {
-		return fmt.Sprintf(`(literal "%s")`, path)
-	}
-	return fmt.Sprintf(`(require-any (literal "%s") (literal "%s"))`, path, resolved)
-}
-
-// runSandboxed runs the helper binary inside a sandbox with the given SBPL
-// profile. Returns the parsed result and the raw combined output.
+// runSandboxed runs the helper binary inside a sandbox with the given rules.
 func runSandboxed(t *testing.T, profile string, testName string, args ...string) helperResult {
 	t.Helper()
 	binary := buildHelper(t)
-
-	// Inject helper binary rules into the profile (after the first line).
-	// We insert after "(deny default)\n" to ensure proper ordering.
-	rules := helperRules()
-	profile = profile + rules
 
 	cmdArgs := []string{"-p", profile, binary, testName}
 	cmdArgs = append(cmdArgs, args...)
@@ -163,14 +114,19 @@ func runSandboxed(t *testing.T, profile string, testName string, args ...string)
 
 	var r helperResult
 	if jsonErr := json.Unmarshal(out, &r); jsonErr != nil {
-		// The helper may have been killed or failed to produce JSON.
 		r.OK = false
 		r.Err = fmt.Sprintf("exit: %v, output: %s", err, string(out))
 	}
 	return r
 }
 
-// expectSuccess asserts the sandboxed operation succeeded.
+// runWithRules builds a profile from rules and runs the helper.
+func runWithRules(t *testing.T, rules []seatbelt.Rule, testName string, args ...string) helperResult {
+	t.Helper()
+	profile := buildProfile(t, rules...)
+	return runSandboxed(t, profile, testName, args...)
+}
+
 func expectSuccess(t *testing.T, r helperResult) {
 	t.Helper()
 	if !r.OK {
@@ -178,14 +134,11 @@ func expectSuccess(t *testing.T, r helperResult) {
 	}
 }
 
-// expectDenied asserts the sandboxed operation was denied.
 func expectDenied(t *testing.T, r helperResult) {
 	t.Helper()
 	if r.OK {
 		t.Fatalf("expected denial, got success (data: %s)", r.Data)
 	}
-	// On macOS, sandbox denials produce "Operation not permitted" (EPERM)
-	// or "Permission denied" (EACCES).
 	errLower := strings.ToLower(r.Err)
 	if !strings.Contains(errLower, "operation not permitted") &&
 		!strings.Contains(errLower, "permission denied") &&
@@ -196,22 +149,180 @@ func expectDenied(t *testing.T, r helperResult) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// FILE SYSTEM TESTS
+// PROFILE BUILDER TESTS
+// ═══════════════════════════════════════════════════════════════════════
+
+func TestBuildProfile_NoRules(t *testing.T) {
+	_, err := seatbelt.BuildProfile()
+	if err != seatbelt.ErrNoRules {
+		t.Fatalf("expected ErrNoRules, got: %v", err)
+	}
+}
+
+func TestBuildProfile_AutoMinimal(t *testing.T) {
+	// When no Import("bsd.sb") is provided, Minimal is auto-included.
+	profile, err := seatbelt.BuildProfile(seatbelt.DenyNetwork())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := profile.String()
+	if !strings.Contains(s, `(import "bsd.sb")`) {
+		t.Fatal("expected bsd.sb import from auto-Minimal")
+	}
+	if !strings.Contains(s, "(allow process-fork)") {
+		t.Fatal("expected process-fork from auto-Minimal")
+	}
+}
+
+func TestBuildProfile_WithoutMinimal(t *testing.T) {
+	profile, err := seatbelt.BuildProfile(
+		seatbelt.WithoutMinimal(),
+		seatbelt.Import("bsd.sb"),
+		seatbelt.AllowFork(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := profile.String()
+	// Should have bsd.sb but NOT the full Minimal set.
+	if !strings.Contains(s, `(import "bsd.sb")`) {
+		t.Fatal("expected bsd.sb import")
+	}
+	if strings.Contains(s, "com.apple.trustd.agent") {
+		t.Fatal("should not have trustd.agent without Minimal")
+	}
+}
+
+func TestBuildProfile_DuplicateImports(t *testing.T) {
+	profile, err := seatbelt.BuildProfile(
+		seatbelt.Import("bsd.sb"),
+		seatbelt.Import("bsd.sb"),
+		seatbelt.AllowFork(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := profile.String()
+	count := strings.Count(s, `(import "bsd.sb")`)
+	if count != 1 {
+		t.Fatalf("expected exactly 1 bsd.sb import, got %d", count)
+	}
+}
+
+func TestBuildProfile_ReadOnly(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS only")
+	}
+	profile, err := seatbelt.BuildProfile(
+		seatbelt.WithoutMinimal(),
+		seatbelt.Import("bsd.sb"),
+		seatbelt.ReadOnly("/etc"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := profile.String()
+	if !strings.Contains(s, "file-read*") {
+		t.Fatal("expected file-read* in profile")
+	}
+	if !strings.Contains(s, "file-read-metadata") {
+		t.Fatal("expected file-read-metadata in profile")
+	}
+	// /etc -> /private/etc on macOS
+	if !strings.Contains(s, "/private/etc") && !strings.Contains(s, `"/etc"`) {
+		t.Fatal("expected /etc path in profile")
+	}
+}
+
+func TestBuildProfile_ReadWrite(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS only")
+	}
+	tmpDir, _ := os.MkdirTemp("", "seatbelt-build-*")
+	defer os.RemoveAll(tmpDir)
+
+	profile, err := seatbelt.BuildProfile(
+		seatbelt.WithoutMinimal(),
+		seatbelt.Import("bsd.sb"),
+		seatbelt.ReadWrite(tmpDir),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := profile.String()
+	if !strings.Contains(s, "file-read*") {
+		t.Fatal("expected file-read* in profile")
+	}
+	if !strings.Contains(s, "file-write*") {
+		t.Fatal("expected file-write* in profile")
+	}
+}
+
+func TestBuildProfile_Custom(t *testing.T) {
+	profile, err := seatbelt.BuildProfile(
+		seatbelt.WithoutMinimal(),
+		seatbelt.Import("bsd.sb"),
+		seatbelt.Custom(`(allow file-read* (literal "/custom/path"))`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(profile.String(), "/custom/path") {
+		t.Fatal("expected custom SBPL in profile")
+	}
+}
+
+func TestBuildProfile_DenyNetworkNoop(t *testing.T) {
+	profile, err := seatbelt.BuildProfile(
+		seatbelt.WithoutMinimal(),
+		seatbelt.Import("bsd.sb"),
+		seatbelt.DenyNetwork(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(profile.String(), "network") {
+		t.Fatal("DenyNetwork should not produce any network SBPL")
+	}
+}
+
+func TestBuildProfile_Presets(t *testing.T) {
+	// Verify presets compose with additional rules.
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS only")
+	}
+	tmpDir, _ := os.MkdirTemp("", "seatbelt-preset-*")
+	defer os.RemoveAll(tmpDir)
+
+	profile, err := seatbelt.BuildProfile(
+		seatbelt.NoNetwork,
+		seatbelt.ReadWrite(tmpDir),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := profile.String()
+	if !strings.Contains(s, `(import "bsd.sb")`) {
+		t.Fatal("expected bsd.sb from NoNetwork preset")
+	}
+	if strings.Contains(s, "(allow network") {
+		t.Fatal("NoNetwork should not allow any network operations")
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// FILE SYSTEM TESTS (via sandbox-exec)
 // ═══════════════════════════════════════════════════════════════════════
 
 func TestFS_ReadAllowedPath(t *testing.T) {
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/etc")),
-	)
-	r := runSandboxed(t, profile, "fs-read-file", "/etc/hosts")
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly("/etc")},
+		"fs-read-file", "/etc/hosts")
 	expectSuccess(t, r)
 }
 
 func TestFS_ReadDeniedPath(t *testing.T) {
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/etc")),
-	)
-	r := runSandboxed(t, profile, "fs-read-file", "/var/log/system.log")
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly("/etc")},
+		"fs-read-file", "/var/log/system.log")
 	expectDenied(t, r)
 }
 
@@ -219,10 +330,8 @@ func TestFS_WriteToReadOnlyPath(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-ro-*")
 	defer os.RemoveAll(tmpDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-write-file", filepath.Join(tmpDir, "blocked.txt"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly(tmpDir)},
+		"fs-write-file", filepath.Join(tmpDir, "blocked.txt"))
 	expectDenied(t, r)
 }
 
@@ -230,10 +339,8 @@ func TestFS_WriteToReadWritePath(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-rw-*")
 	defer os.RemoveAll(tmpDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-write* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-write-file", filepath.Join(tmpDir, "allowed.txt"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadWrite(tmpDir)},
+		"fs-write-file", filepath.Join(tmpDir, "allowed.txt"))
 	expectSuccess(t, r)
 }
 
@@ -243,10 +350,8 @@ func TestFS_WriteToUnmentionedPath(t *testing.T) {
 	otherDir, _ := os.MkdirTemp("", "seatbelt-denied-*")
 	defer os.RemoveAll(otherDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-write* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-write-file", filepath.Join(otherDir, "blocked.txt"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadWrite(tmpDir)},
+		"fs-write-file", filepath.Join(otherDir, "blocked.txt"))
 	expectDenied(t, r)
 }
 
@@ -254,10 +359,8 @@ func TestFS_MkdirDenied(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-mkdir-*")
 	defer os.RemoveAll(tmpDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-mkdir", filepath.Join(tmpDir, "newdir"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly(tmpDir)},
+		"fs-mkdir", filepath.Join(tmpDir, "newdir"))
 	expectDenied(t, r)
 }
 
@@ -265,10 +368,8 @@ func TestFS_MkdirAllowed(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-mkdir-*")
 	defer os.RemoveAll(tmpDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-write* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-mkdir", filepath.Join(tmpDir, "newdir"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadWrite(tmpDir)},
+		"fs-mkdir", filepath.Join(tmpDir, "newdir"))
 	expectSuccess(t, r)
 }
 
@@ -277,44 +378,33 @@ func TestFS_RemoveDenied(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 	os.WriteFile(filepath.Join(tmpDir, "victim.txt"), []byte("data"), 0644)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-remove", filepath.Join(tmpDir, "victim.txt"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly(tmpDir)},
+		"fs-remove", filepath.Join(tmpDir, "victim.txt"))
 	expectDenied(t, r)
 }
 
 func TestFS_StatAllowed(t *testing.T) {
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/etc")),
-	)
-	r := runSandboxed(t, profile, "fs-stat", "/etc/hosts")
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly("/etc")},
+		"fs-stat", "/etc/hosts")
 	expectSuccess(t, r)
 }
 
 func TestFS_StatAllowedByBsdSb(t *testing.T) {
-	// bsd.sb (Apple's base system profile) grants file-read-metadata
-	// broadly, so os.Stat succeeds even without explicit file rules.
-	// This test documents that behavior.
+	// bsd.sb grants file-read-metadata broadly.
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-stat-bsd-*")
 	defer os.RemoveAll(tmpDir)
 	os.WriteFile(filepath.Join(tmpDir, "test.txt"), []byte("data"), 0644)
 
-	profile := sbProfile() // No explicit file rules
-	r := runSandboxed(t, profile, "fs-stat", filepath.Join(tmpDir, "test.txt"))
-	// bsd.sb allows file-read-metadata, so stat succeeds.
+	r := runWithRules(t, nil, "fs-stat", filepath.Join(tmpDir, "test.txt"))
 	expectSuccess(t, r)
 }
 
 func TestFS_ReadDataDenied(t *testing.T) {
-	// While bsd.sb allows file-read-metadata (stat), it does NOT allow
-	// file-read-data for arbitrary paths. Verify read-data denial.
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-readdata-denied-*")
 	defer os.RemoveAll(tmpDir)
 	os.WriteFile(filepath.Join(tmpDir, "secret.txt"), []byte("data"), 0644)
 
-	profile := sbProfile() // No explicit file rules for this tmpDir
-	r := runSandboxed(t, profile, "fs-read-file", filepath.Join(tmpDir, "secret.txt"))
+	r := runWithRules(t, nil, "fs-read-file", filepath.Join(tmpDir, "secret.txt"))
 	expectDenied(t, r)
 }
 
@@ -323,11 +413,8 @@ func TestFS_RenameAllowed(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 	os.WriteFile(filepath.Join(tmpDir, "a.txt"), []byte("data"), 0644)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-write* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-rename",
-		filepath.Join(tmpDir, "a.txt"), filepath.Join(tmpDir, "b.txt"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadWrite(tmpDir)},
+		"fs-rename", filepath.Join(tmpDir, "a.txt"), filepath.Join(tmpDir, "b.txt"))
 	expectSuccess(t, r)
 }
 
@@ -336,27 +423,19 @@ func TestFS_RenameDenied(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 	os.WriteFile(filepath.Join(tmpDir, "a.txt"), []byte("data"), 0644)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-rename",
-		filepath.Join(tmpDir, "a.txt"), filepath.Join(tmpDir, "b.txt"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly(tmpDir)},
+		"fs-rename", filepath.Join(tmpDir, "a.txt"), filepath.Join(tmpDir, "b.txt"))
 	expectDenied(t, r)
 }
 
 func TestFS_SymlinkTraversal(t *testing.T) {
-	// /tmp is a symlink to /private/tmp on macOS. Both paths should work
-	// when the profile includes both.
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/tmp")),
-	)
-	// Create a test file
 	tmpFile, _ := os.CreateTemp("/tmp", "seatbelt-symlink-*")
 	tmpFile.Write([]byte("hello"))
 	tmpFile.Close()
 	defer os.Remove(tmpFile.Name())
 
-	r := runSandboxed(t, profile, "fs-read-file", tmpFile.Name())
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly("/tmp")},
+		"fs-read-file", tmpFile.Name())
 	expectSuccess(t, r)
 }
 
@@ -364,12 +443,8 @@ func TestFS_HardlinkEscape(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-hardlink-*")
 	defer os.RemoveAll(tmpDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-write* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-	)
-	// Try to create hardlink from /etc/hosts into the writable directory
-	r := runSandboxed(t, profile, "fs-hardlink",
-		"/etc/hosts", filepath.Join(tmpDir, "hosts-link"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadWrite(tmpDir)},
+		"fs-hardlink", "/etc/hosts", filepath.Join(tmpDir, "hosts-link"))
 	expectDenied(t, r)
 }
 
@@ -377,10 +452,8 @@ func TestFS_WriteOnlyCanWrite(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-wo-*")
 	defer os.RemoveAll(tmpDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-write* %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-write-only-write", filepath.Join(tmpDir, "wo.txt"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.WriteOnly(tmpDir)},
+		"fs-write-only-write", filepath.Join(tmpDir, "wo.txt"))
 	expectSuccess(t, r)
 }
 
@@ -389,10 +462,8 @@ func TestFS_WriteOnlyCannotRead(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 	os.WriteFile(filepath.Join(tmpDir, "wo.txt"), []byte("secret"), 0644)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-write* %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-write-only-read", filepath.Join(tmpDir, "wo.txt"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.WriteOnly(tmpDir)},
+		"fs-write-only-read", filepath.Join(tmpDir, "wo.txt"))
 	expectDenied(t, r)
 }
 
@@ -405,24 +476,19 @@ func TestFS_ParentOfAllowedNotAccessible(t *testing.T) {
 	os.Mkdir(siblingDir, 0755)
 	os.WriteFile(filepath.Join(siblingDir, "secret.txt"), []byte("secret"), 0644)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath(subDir)),
-	)
-	r := runSandboxed(t, profile, "fs-read-file", filepath.Join(siblingDir, "secret.txt"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly(subDir)},
+		"fs-read-file", filepath.Join(siblingDir, "secret.txt"))
 	expectDenied(t, r)
 }
 
 func TestFS_ReadDir(t *testing.T) {
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/etc")),
-	)
-	r := runSandboxed(t, profile, "fs-readdir", "/etc")
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly("/etc")},
+		"fs-readdir", "/etc")
 	expectSuccess(t, r)
 }
 
 func TestFS_ReadDirDenied(t *testing.T) {
-	profile := sbProfile() // No file rules
-	r := runSandboxed(t, profile, "fs-readdir", "/etc")
+	r := runWithRules(t, nil, "fs-readdir", "/etc")
 	expectDenied(t, r)
 }
 
@@ -431,75 +497,61 @@ func TestFS_ReadDirDenied(t *testing.T) {
 // ═══════════════════════════════════════════════════════════════════════
 
 func TestNet_DeniedByDefault(t *testing.T) {
-	profile := sbProfile() // No network rules
-	r := runSandboxed(t, profile, "net-dial-tcp", "1.1.1.1:80")
+	r := runWithRules(t, nil, "net-dial-tcp", "1.1.1.1:80")
 	expectDenied(t, r)
 }
 
 func TestNet_OutboundAllowed(t *testing.T) {
-	profile := sbProfile(
-		`(allow network-outbound)`,
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/etc")),
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/private/var/run/resolv.conf")),
-	)
-	r := runSandboxed(t, profile, "net-dial-tcp", "1.1.1.1:80")
+	r := runWithRules(t, []seatbelt.Rule{
+		seatbelt.AllowNetworkOutbound(),
+		seatbelt.ReadOnly("/etc", "/private/var/run"),
+	}, "net-dial-tcp", "1.1.1.1:80")
 	expectSuccess(t, r)
 }
 
 func TestNet_InboundDeniedWhenOutboundOnly(t *testing.T) {
-	profile := sbProfile(
-		`(allow network-outbound)`,
-	)
-	r := runSandboxed(t, profile, "net-listen-tcp")
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.AllowNetworkOutbound()},
+		"net-listen-tcp")
 	expectDenied(t, r)
 }
 
 func TestNet_InboundAllowed(t *testing.T) {
-	profile := sbProfile(
-		`(allow network-inbound)`,
-		`(allow network-outbound)`, // Need outbound for bind
-	)
-	r := runSandboxed(t, profile, "net-listen-tcp")
+	r := runWithRules(t, []seatbelt.Rule{
+		seatbelt.AllowNetworkInbound(),
+		seatbelt.AllowNetworkOutbound(),
+	}, "net-listen-tcp")
 	expectSuccess(t, r)
 }
 
 func TestNet_FullNetworkAllowed(t *testing.T) {
-	profile := sbProfile(
-		`(allow network*)`,
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/etc")),
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/private/var/run/resolv.conf")),
-	)
-	// Test both dial and listen
-	r := runSandboxed(t, profile, "net-dial-tcp", "1.1.1.1:80")
+	rules := []seatbelt.Rule{
+		seatbelt.AllowNetwork(),
+		seatbelt.ReadOnly("/etc", "/private/var/run"),
+	}
+	r := runWithRules(t, rules, "net-dial-tcp", "1.1.1.1:80")
 	expectSuccess(t, r)
-
-	r = runSandboxed(t, profile, "net-listen-tcp")
+	r = runWithRules(t, rules, "net-listen-tcp")
 	expectSuccess(t, r)
 }
 
 func TestNet_UDPDenied(t *testing.T) {
-	profile := sbProfile() // No network rules
-	r := runSandboxed(t, profile, "net-dial-udp", "8.8.8.8:53")
+	r := runWithRules(t, nil, "net-dial-udp", "8.8.8.8:53")
 	expectDenied(t, r)
 }
 
 func TestNet_UDPAllowedWithFullNetwork(t *testing.T) {
-	profile := sbProfile(
-		`(allow network*)`,
-	)
-	r := runSandboxed(t, profile, "net-dial-udp", "8.8.8.8:53")
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.AllowNetwork()},
+		"net-dial-udp", "8.8.8.8:53")
 	expectSuccess(t, r)
 }
 
 func TestNet_LocalhostDenied(t *testing.T) {
-	profile := sbProfile() // No network rules
-	r := runSandboxed(t, profile, "net-localhost", "12345")
+	r := runWithRules(t, nil, "net-localhost", "12345")
 	expectDenied(t, r)
 }
 
 func TestNet_HTTPGetDenied(t *testing.T) {
-	profile := sbProfile() // No network rules
-	r := runSandboxed(t, profile, "net-http-get", "http://example.com")
+	r := runWithRules(t, nil, "net-http-get", "http://example.com")
 	expectDenied(t, r)
 }
 
@@ -508,66 +560,53 @@ func TestNet_HTTPGetDenied(t *testing.T) {
 // ═══════════════════════════════════════════════════════════════════════
 
 func TestProc_ExecAllowedBinary(t *testing.T) {
-	profile := sbProfile(
-		fmt.Sprintf(`(allow process-exec %s)`, resolvedLiteral("/bin/echo")),
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/bin")),
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/usr/lib")),
-	)
-	r := runSandboxed(t, profile, "proc-exec", "/bin/echo", "hello")
+	r := runWithRules(t, []seatbelt.Rule{
+		seatbelt.AllowExec("/bin/echo"),
+		seatbelt.ReadOnly("/bin", "/usr/lib"),
+	}, "proc-exec", "/bin/echo", "hello")
 	expectSuccess(t, r)
 	if !strings.Contains(r.Data, "hello") {
-		t.Fatalf("expected output to contain 'hello', got: %s", r.Data)
+		t.Fatalf("expected 'hello', got: %s", r.Data)
 	}
 }
 
 func TestProc_ExecDeniedBinary(t *testing.T) {
-	profile := sbProfile(
-		fmt.Sprintf(`(allow process-exec %s)`, resolvedLiteral("/bin/echo")),
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/usr")),
-	)
-	r := runSandboxed(t, profile, "proc-exec", "/usr/bin/id")
+	r := runWithRules(t, []seatbelt.Rule{
+		seatbelt.AllowExec("/bin/echo"),
+		seatbelt.ReadOnly("/usr"),
+	}, "proc-exec", "/usr/bin/id")
 	expectDenied(t, r)
 }
 
 func TestProc_ExecNoRules(t *testing.T) {
-	profile := sbProfile() // No exec rules
-	r := runSandboxed(t, profile, "proc-exec", "/bin/echo", "nope")
+	r := runWithRules(t, nil, "proc-exec", "/bin/echo", "nope")
 	expectDenied(t, r)
 }
 
 func TestProc_ExecDirectoryAllowsAllInDir(t *testing.T) {
-	profile := sbProfile(
-		fmt.Sprintf(`(allow process-exec %s)`, resolvedSubpath("/usr/bin")),
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/usr")),
-	)
-	r := runSandboxed(t, profile, "proc-exec", "/usr/bin/env")
+	r := runWithRules(t, []seatbelt.Rule{
+		seatbelt.AllowExec("/usr/bin"),
+		seatbelt.ReadOnly("/usr"),
+	}, "proc-exec", "/usr/bin/env")
 	expectSuccess(t, r)
 }
 
 func TestProc_ShellEscapeAttempt(t *testing.T) {
-	// Allow /bin/sh but NOT /bin/cat. The shell should be able to start
-	// but the inner command should be denied.
-	profile := sbProfile(
-		fmt.Sprintf(`(allow process-exec %s)`, resolvedLiteral("/bin/sh")),
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/bin")),
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/usr/lib")),
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/etc")),
-	)
-	r := runSandboxed(t, profile, "proc-exec-shell-escape", "cat /etc/shadow")
+	r := runWithRules(t, []seatbelt.Rule{
+		seatbelt.AllowExec("/bin/sh"),
+		seatbelt.ReadOnly("/bin", "/usr/lib", "/etc"),
+	}, "proc-exec-shell-escape", "cat /etc/shadow")
 	expectDenied(t, r)
 }
 
 func TestProc_ExecWrittenScript(t *testing.T) {
-	// Write a script to an allowed path, then try to execute it.
-	// The script should not be executable if its path is not in AllowExec.
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-script-*")
 	defer os.RemoveAll(tmpDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-write* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-		// Deliberately NOT allowing process-exec for tmpDir
-	)
-	r := runSandboxed(t, profile, "proc-exec-written-script", tmpDir)
+	r := runWithRules(t, []seatbelt.Rule{
+		seatbelt.ReadWrite(tmpDir),
+		// Deliberately NOT allowing exec for tmpDir
+	}, "proc-exec-written-script", tmpDir)
 	expectDenied(t, r)
 }
 
@@ -579,13 +618,10 @@ func TestMach_TLSWithTrustd(t *testing.T) {
 	if testing.Short() {
 		t.Skip("TLS handshake test requires network access")
 	}
-	profile := sbProfile(
-		`(allow network*)`,
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/etc")),
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/private/var/run")),
-		// trustd.agent is already in sbProfile's Minimal set
-	)
-	r := runSandboxed(t, profile, "mach-tls-handshake")
+	r := runWithRules(t, []seatbelt.Rule{
+		seatbelt.AllowNetwork(),
+		seatbelt.ReadOnly("/etc", "/private/var/run"),
+	}, "mach-tls-handshake")
 	expectSuccess(t, r)
 }
 
@@ -594,37 +630,16 @@ func TestMach_TLSWithTrustd(t *testing.T) {
 // ═══════════════════════════════════════════════════════════════════════
 
 func TestSysctl_ReadAllowed(t *testing.T) {
-	// sysctl-read is in the base sbProfile
-	profile := sbProfile()
-	r := runSandboxed(t, profile, "sysctl-read", "kern.ostype")
+	r := runWithRules(t, nil, "sysctl-read", "kern.ostype")
 	expectSuccess(t, r)
 	if r.Data != "Darwin" {
 		t.Fatalf("expected kern.ostype=Darwin, got: %s", r.Data)
 	}
 }
 
-func TestSysctl_ReadDeniedWithoutRule(t *testing.T) {
-	// Note: bsd.sb (Apple's base system profile) grants sysctl-read
-	// implicitly, so it cannot be independently denied while importing
-	// bsd.sb. This test verifies the behavior: sysctl-read is available
-	// as part of bsd.sb even without an explicit allow rule.
-	//
-	// This is documented as a known behavior — the Minimal preset
-	// includes sysctl-read explicitly for clarity, but bsd.sb already
-	// provides it.
-	var sb strings.Builder
-	sb.WriteString("(version 1)\n")
-	sb.WriteString("(deny default)\n")
-	sb.WriteString("(import \"bsd.sb\")\n")
-	sb.WriteString("(allow process-fork)\n")
-	sb.WriteString("(allow signal)\n")
-	// No explicit sysctl-read — but bsd.sb provides it.
-	sb.WriteString("(allow mach-lookup (global-name \"com.apple.trustd.agent\"))\n")
-	sb.WriteString("(allow file-read* file-read-metadata (subpath \"/usr/lib\"))\n")
-	sb.WriteString("(allow file-read* file-read-metadata (subpath \"/System/Library\"))\n")
-
-	r := runSandboxed(t, sb.String(), "sysctl-read", "kern.ostype")
-	// bsd.sb allows sysctl-read, so this succeeds even without an explicit rule.
+func TestSysctl_ReadProvidedByBsdSb(t *testing.T) {
+	// bsd.sb grants sysctl-read implicitly — documented behavior.
+	r := runWithRules(t, nil, "sysctl-read", "kern.ostype")
 	expectSuccess(t, r)
 }
 
@@ -633,15 +648,12 @@ func TestSysctl_ReadDeniedWithoutRule(t *testing.T) {
 // ═══════════════════════════════════════════════════════════════════════
 
 func TestSignal_SelfAllowed(t *testing.T) {
-	profile := sbProfile()
-	r := runSandboxed(t, profile, "signal-self")
+	r := runWithRules(t, nil, "signal-self")
 	expectSuccess(t, r)
 }
 
 func TestSignal_OtherProcess(t *testing.T) {
-	profile := sbProfile()
-	// Signaling PID 1 should be denied by the OS regardless of sandbox
-	r := runSandboxed(t, profile, "signal-other")
+	r := runWithRules(t, nil, "signal-other")
 	expectDenied(t, r)
 }
 
@@ -650,17 +662,11 @@ func TestSignal_OtherProcess(t *testing.T) {
 // ═══════════════════════════════════════════════════════════════════════
 
 func TestEscape_SymlinkPivot(t *testing.T) {
-	// Create a symlink in a writable dir pointing to a restricted path,
-	// then try to read through it. The kernel resolves vnodes, so this
-	// should be denied.
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-escape-symlink-*")
 	defer os.RemoveAll(tmpDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-write* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-		// /var/log is NOT in the allowed paths
-	)
-	r := runSandboxed(t, profile, "escape-symlink-pivot", tmpDir, "/var/log/system.log")
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadWrite(tmpDir)},
+		"escape-symlink-pivot", tmpDir, "/var/log/system.log")
 	expectDenied(t, r)
 }
 
@@ -670,70 +676,39 @@ func TestEscape_RenameToRestrictedPath(t *testing.T) {
 	targetDir, _ := os.MkdirTemp("", "seatbelt-escape-target-*")
 	defer os.RemoveAll(targetDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-write* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-		// targetDir is NOT writable
-	)
-	r := runSandboxed(t, profile, "escape-rename-to-denied",
-		filepath.Join(tmpDir, "src.txt"),
-		filepath.Join(targetDir, "dst.txt"))
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadWrite(tmpDir)},
+		"escape-rename-to-denied",
+		filepath.Join(tmpDir, "src.txt"), filepath.Join(targetDir, "dst.txt"))
 	expectDenied(t, r)
 }
 
 func TestEscape_Chroot(t *testing.T) {
-	profile := sbProfile()
-	r := runSandboxed(t, profile, "escape-chroot")
+	r := runWithRules(t, nil, "escape-chroot")
 	expectDenied(t, r)
 }
 
 func TestEscape_Ptrace(t *testing.T) {
-	profile := sbProfile()
-	r := runSandboxed(t, profile, "escape-ptrace")
+	r := runWithRules(t, nil, "escape-ptrace")
 	expectDenied(t, r)
 }
 
 func TestEscape_AppleScript(t *testing.T) {
-	profile := sbProfile() // No exec, no appleevent-send
-	r := runSandboxed(t, profile, "escape-applescript")
+	r := runWithRules(t, nil, "escape-applescript")
 	expectDenied(t, r)
 }
 
 func TestEscape_Keychain(t *testing.T) {
-	// Without allowing exec of /usr/bin/security and the Mach lookups
-	// for SecurityServer, this should fail.
-	profile := sbProfile()
-	r := runSandboxed(t, profile, "escape-keychain")
+	r := runWithRules(t, nil, "escape-keychain")
 	expectDenied(t, r)
 }
 
-func TestEscape_DoubleSandboxTighter(t *testing.T) {
-	// Apply a permissive sandbox, then from within it try to apply a
-	// tighter sandbox. This should work (sandboxes stack).
-	profile := sbProfile(
-		`(allow network*)`,
-		fmt.Sprintf(`(allow file-read* file-write* file-read-metadata %s)`, resolvedSubpath("/tmp")),
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/usr")),
-		fmt.Sprintf(`(allow process-exec %s)`, resolvedSubpath("/usr/bin")),
-	)
-	r := runSandboxed(t, profile, "escape-double-sandbox-tighter")
-	// The inner sandbox should succeed in applying but may restrict operations.
-	// We just verify the process doesn't crash.
-	if !r.OK {
-		t.Logf("double sandbox result: %s (this may be expected)", r.Err)
-	}
-}
-
 func TestEscape_MmapDeniedFile(t *testing.T) {
-	profile := sbProfile() // No file rules beyond bsd.sb
-	r := runSandboxed(t, profile, "escape-mmap-denied", "/etc/hosts")
-	// The open() call should fail before mmap is even attempted
+	r := runWithRules(t, nil, "escape-mmap-denied", "/etc/hosts")
 	expectDenied(t, r)
 }
 
 func TestEscape_EnvExfiltration(t *testing.T) {
-	// Verify the sandbox marker env vars are visible (by design).
-	profile := sbProfile()
-	r := runSandboxed(t, profile, "escape-env-exfil")
+	r := runWithRules(t, nil, "escape-env-exfil")
 	expectSuccess(t, r)
 	if !strings.Contains(r.Data, "marker=1") {
 		t.Fatalf("expected _SEATBELT_CHILD=1 in env, got: %s", r.Data)
@@ -741,29 +716,23 @@ func TestEscape_EnvExfiltration(t *testing.T) {
 }
 
 func TestEscape_DevFd(t *testing.T) {
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/dev")),
-	)
-	r := runSandboxed(t, profile, "escape-dev-fd")
-	// /dev/fd access should work since /dev is readable
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly("/dev")},
+		"escape-dev-fd")
 	expectSuccess(t, r)
 }
 
 func TestEscape_IPCShm(t *testing.T) {
-	// Without AllowIPCPosixShm, shm_open should be denied.
-	var sb strings.Builder
-	sb.WriteString("(version 1)\n")
-	sb.WriteString("(deny default)\n")
-	sb.WriteString("(import \"bsd.sb\")\n")
-	sb.WriteString("(allow process-fork)\n")
-	sb.WriteString("(allow signal)\n")
-	sb.WriteString("(allow sysctl-read)\n")
-	sb.WriteString("(allow mach-lookup (global-name \"com.apple.trustd.agent\"))\n")
-	sb.WriteString("(allow file-read* file-read-metadata (subpath \"/usr/lib\"))\n")
-	sb.WriteString("(allow file-read* file-read-metadata (subpath \"/System/Library\"))\n")
-	// Deliberately NO ipc-posix-shm-*
-
-	r := runSandboxed(t, sb.String(), "escape-ipc-shm")
+	// Build a custom profile WITHOUT ipc-posix-sem to test IPC denial.
+	profile := buildProfile(t,
+		seatbelt.WithoutMinimal(),
+		seatbelt.Import("bsd.sb"),
+		seatbelt.AllowFork(),
+		seatbelt.AllowSignal(),
+		seatbelt.AllowSysctlRead(),
+		seatbelt.AllowMachLookup("com.apple.trustd.agent"),
+		// No AllowIPCPosixShm
+	)
+	r := runSandboxed(t, profile, "escape-ipc-shm")
 	expectDenied(t, r)
 }
 
@@ -773,38 +742,30 @@ func TestEscape_IPCShm(t *testing.T) {
 
 func TestLifecycle_CleanExit(t *testing.T) {
 	binary := buildHelper(t)
-	profile := sbProfile() + helperRules()
-	// exit-code calls os.Exit directly; we verify via the exit code
-	// of sandbox-exec itself.
+	profile := buildProfile(t)
 	cmd := exec.Command("sandbox-exec", "-p", profile, binary, "exit-code", "0")
 	cmd.Env = append(os.Environ(), "_SEATBELT_CHILD=1")
-	err := cmd.Run()
-	if err != nil {
+	if err := cmd.Run(); err != nil {
 		t.Fatalf("expected clean exit, got: %v", err)
 	}
 }
 
 func TestLifecycle_ErrorExit(t *testing.T) {
 	binary := buildHelper(t)
-	profile := sbProfile() + helperRules()
+	profile := buildProfile(t)
 	cmd := exec.Command("sandbox-exec", "-p", profile, binary, "exit-code", "42")
 	cmd.Env = append(os.Environ(), "_SEATBELT_CHILD=1")
 	err := cmd.Run()
 	if err == nil {
-		t.Fatal("expected non-zero exit, got success")
+		t.Fatal("expected non-zero exit")
 	}
-	exitErr, ok := err.(*exec.ExitError)
-	if !ok {
-		t.Fatalf("expected ExitError, got: %T", err)
-	}
-	if exitErr.ExitCode() != 42 {
-		t.Fatalf("expected exit code 42, got: %d", exitErr.ExitCode())
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 42 {
+		t.Fatalf("expected exit code 42, got: %v", err)
 	}
 }
 
 func TestLifecycle_ArgsPreservation(t *testing.T) {
-	profile := sbProfile()
-	r := runSandboxed(t, profile, "print-args")
+	r := runWithRules(t, nil, "print-args")
 	expectSuccess(t, r)
 	if !strings.Contains(r.Data, "print-args") {
 		t.Fatalf("expected 'print-args' in args, got: %s", r.Data)
@@ -813,7 +774,7 @@ func TestLifecycle_ArgsPreservation(t *testing.T) {
 
 func TestLifecycle_EnvPreservation(t *testing.T) {
 	binary := buildHelper(t)
-	profile := sbProfile() + helperRules()
+	profile := buildProfile(t)
 	cmd := exec.Command("sandbox-exec", "-p", profile, binary, "print-env", "SEATBELT_TEST_VAR")
 	cmd.Env = append(os.Environ(), "_SEATBELT_CHILD=1", "SEATBELT_TEST_VAR=hello_from_parent")
 	out, err := cmd.CombinedOutput()
@@ -823,15 +784,13 @@ func TestLifecycle_EnvPreservation(t *testing.T) {
 	var r helperResult
 	json.Unmarshal(out, &r)
 	if r.Data != "hello_from_parent" {
-		t.Fatalf("expected env var value 'hello_from_parent', got: %s", r.Data)
+		t.Fatalf("expected 'hello_from_parent', got: %s", r.Data)
 	}
 }
 
 func TestLifecycle_CWDPreservation(t *testing.T) {
 	binary := buildHelper(t)
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/tmp")),
-	) + helperRules()
+	profile := buildProfile(t, seatbelt.ReadOnly("/tmp"))
 	cmd := exec.Command("sandbox-exec", "-p", profile, binary, "print-cwd")
 	cmd.Dir = "/tmp"
 	cmd.Env = append(os.Environ(), "_SEATBELT_CHILD=1")
@@ -848,8 +807,7 @@ func TestLifecycle_CWDPreservation(t *testing.T) {
 }
 
 func TestLifecycle_IsSandboxed(t *testing.T) {
-	profile := sbProfile()
-	r := runSandboxed(t, profile, "is-sandboxed")
+	r := runWithRules(t, nil, "is-sandboxed")
 	expectSuccess(t, r)
 	if r.Data != "1" {
 		t.Fatalf("expected _SEATBELT_CHILD=1, got: %s", r.Data)
@@ -857,11 +815,31 @@ func TestLifecycle_IsSandboxed(t *testing.T) {
 }
 
 func TestLifecycle_RuntimeInfo(t *testing.T) {
-	profile := sbProfile()
-	r := runSandboxed(t, profile, "print-runtime")
+	r := runWithRules(t, nil, "print-runtime")
 	expectSuccess(t, r)
 	if !strings.Contains(r.Data, "os=darwin") {
-		t.Fatalf("expected darwin runtime, got: %s", r.Data)
+		t.Fatalf("expected darwin, got: %s", r.Data)
+	}
+}
+
+func TestLifecycle_IsSandboxedAPI(t *testing.T) {
+	// In the test process (not sandboxed), IsSandboxed should be false.
+	if seatbelt.IsSandboxed() {
+		t.Fatal("IsSandboxed should return false in test process")
+	}
+	if seatbelt.SandboxProfile() != "" {
+		t.Fatal("SandboxProfile should return empty in test process")
+	}
+}
+
+func TestLifecycle_RestrictErrors(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS only")
+	}
+	// Empty rules should error.
+	_, err := seatbelt.Restrict()
+	if err != seatbelt.ErrNoRules {
+		t.Fatalf("expected ErrNoRules, got: %v", err)
 	}
 }
 
@@ -873,10 +851,8 @@ func TestStress_ConcurrentReadAllowed(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stress test")
 	}
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-read-metadata %s)`, resolvedSubpath("/etc")),
-	)
-	r := runSandboxed(t, profile, "concurrent-read", "/etc/hosts")
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadOnly("/etc")},
+		"concurrent-read", "/etc/hosts")
 	expectSuccess(t, r)
 }
 
@@ -884,11 +860,10 @@ func TestStress_ConcurrentDeniedAccess(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stress test")
 	}
-	profile := sbProfile() // No file rules
-	r := runSandboxed(t, profile, "concurrent-denied", "/etc/hosts")
-	expectSuccess(t, r) // Helper reports success with count of denials
+	r := runWithRules(t, nil, "concurrent-denied", "/etc/hosts")
+	expectSuccess(t, r)
 	if !strings.Contains(r.Data, "100 denied") {
-		t.Fatalf("expected all 100 accesses denied, got: %s", r.Data)
+		t.Fatalf("expected all 100 denied, got: %s", r.Data)
 	}
 }
 
@@ -899,10 +874,8 @@ func TestStress_ManyOpenFiles(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-stress-*")
 	defer os.RemoveAll(tmpDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-write* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-open-many", tmpDir)
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadWrite(tmpDir)},
+		"fs-open-many", tmpDir)
 	expectSuccess(t, r)
 }
 
@@ -913,10 +886,8 @@ func TestStress_LargeFileIO(t *testing.T) {
 	tmpDir, _ := os.MkdirTemp("", "seatbelt-largefile-*")
 	defer os.RemoveAll(tmpDir)
 
-	profile := sbProfile(
-		fmt.Sprintf(`(allow file-read* file-write* file-read-metadata %s)`, resolvedSubpath(tmpDir)),
-	)
-	r := runSandboxed(t, profile, "fs-large-file", tmpDir)
+	r := runWithRules(t, []seatbelt.Rule{seatbelt.ReadWrite(tmpDir)},
+		"fs-large-file", tmpDir)
 	expectSuccess(t, r)
 }
 
@@ -924,9 +895,8 @@ func TestStress_RapidReexec(t *testing.T) {
 	if testing.Short() {
 		t.Skip("stress test")
 	}
-	profile := sbProfile()
 	for i := 0; i < 10; i++ {
-		r := runSandboxed(t, profile, "noop")
+		r := runWithRules(t, nil, "noop")
 		expectSuccess(t, r)
 	}
 }
