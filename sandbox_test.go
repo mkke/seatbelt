@@ -232,6 +232,14 @@ func TestBuildProfile_ReadOnly(t *testing.T) {
 	if !strings.Contains(s, "/private/etc") && !strings.Contains(s, `"/etc"`) {
 		t.Fatal("expected /etc path in profile")
 	}
+	// ReadOnly must emit the file-issue-extension grant with the
+	// read class so shared read mmap works on macOS 14+.
+	if !strings.Contains(s, "file-issue-extension") {
+		t.Fatal("expected file-issue-extension in profile")
+	}
+	if !strings.Contains(s, `"com.apple.app-sandbox.read"`) {
+		t.Fatal("expected com.apple.app-sandbox.read extension class in profile")
+	}
 }
 
 func TestBuildProfile_ReadWrite(t *testing.T) {
@@ -255,6 +263,19 @@ func TestBuildProfile_ReadWrite(t *testing.T) {
 	}
 	if !strings.Contains(s, "file-write*") {
 		t.Fatal("expected file-write* in profile")
+	}
+	// ReadWrite must emit file-issue-extension grants for both read
+	// and read-write classes. The read-write class is what SQLite's
+	// -shm mmap(MAP_SHARED|PROT_WRITE) needs; without it the mmap
+	// fails with EPERM (SQLITE_IOERR_SHMMAP) on macOS 14+.
+	if !strings.Contains(s, "file-issue-extension") {
+		t.Fatal("expected file-issue-extension in profile")
+	}
+	if !strings.Contains(s, `"com.apple.app-sandbox.read"`) {
+		t.Fatal("expected com.apple.app-sandbox.read extension class in profile")
+	}
+	if !strings.Contains(s, `"com.apple.app-sandbox.read-write"`) {
+		t.Fatal("expected com.apple.app-sandbox.read-write extension class in profile")
 	}
 }
 

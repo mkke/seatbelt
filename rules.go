@@ -3,9 +3,22 @@ package seatbelt
 import "fmt"
 
 // fileRule allows file operations on specific paths.
+//
+// In addition to the primary file-read*/file-write* allowance, each
+// rule also emits matching file-issue-extension allowances for the
+// extension classes listed in extClasses. This mirrors Apple's own
+// system-profile idiom (the `read-and-issue-extensions` and
+// `read-write-and-issue-extensions` helpers defined throughout
+// /System/Library/Sandbox/Profiles/) and is required for operations
+// that dispatch into the kernel's extension-class check — most
+// notably writable shared mmap (MAP_SHARED|PROT_WRITE), which SQLite
+// uses for its -shm files. Without the extension grant, the mmap
+// fails with EPERM (SQLITE_IOERR_SHMMAP) on macOS 14+ even when
+// file-read* and file-write* are allowed on the containing path.
 type fileRule struct {
-	ops   []string // e.g. "file-read*", "file-write*", "file-read-metadata"
-	paths []string
+	ops        []string // e.g. "file-read*", "file-write*", "file-read-metadata"
+	paths      []string
+	extClasses []string // extension classes for the file-issue-extension grant
 }
 
 func (r *fileRule) sbpl() []string {
@@ -20,30 +33,47 @@ func (r *fileRule) sbpl() []string {
 		}
 		ops += op
 	}
-	return []string{fmt.Sprintf("(allow %s %s)", ops, pathFilters(resolved))}
+	filter := pathFilters(resolved)
+	result := []string{fmt.Sprintf("(allow %s %s)", ops, filter)}
+	for _, class := range r.extClasses {
+		result = append(result, fmt.Sprintf(
+			`(allow file-issue-extension (require-all (extension-class "%s") %s))`,
+			class, filter))
+	}
+	return result
 }
 
 // ReadOnly allows reading files and metadata under the given paths.
+// Also grants file-issue-extension with the read extension class so
+// shared read mappings (mmap MAP_SHARED|PROT_READ) work on macOS 14+.
 func ReadOnly(paths ...string) Rule {
 	return &fileRule{
-		ops:   []string{"file-read*", "file-read-metadata"},
-		paths: paths,
+		ops:        []string{"file-read*", "file-read-metadata"},
+		paths:      paths,
+		extClasses: []string{"com.apple.app-sandbox.read"},
 	}
 }
 
 // ReadWrite allows reading and writing files under the given paths.
+// Also grants file-issue-extension with both read and read-write
+// extension classes so writable shared mappings work on macOS 14+
+// — notably SQLite's -shm mmap, which fails with EPERM without
+// the read-write extension.
 func ReadWrite(paths ...string) Rule {
 	return &fileRule{
-		ops:   []string{"file-read*", "file-write*", "file-read-metadata"},
-		paths: paths,
+		ops:        []string{"file-read*", "file-write*", "file-read-metadata"},
+		paths:      paths,
+		extClasses: []string{"com.apple.app-sandbox.read", "com.apple.app-sandbox.read-write"},
 	}
 }
 
 // WriteOnly allows writing (but not reading) files under the given paths.
+// Also grants file-issue-extension with the read-write extension class.
 func WriteOnly(paths ...string) Rule {
 	return &fileRule{
-		ops:   []string{"file-write*"},
-		paths: paths,
+		ops:        []string{"file-write*"},
+		paths:      paths,
+		extClasses: []string{"com.apple.app-sandbox.read-write"},
 	}
 }
 
