@@ -34,11 +34,22 @@ func (r *fileRule) sbpl() []string {
 		ops += op
 	}
 	filter := pathFilters(resolved)
+	// When a rule has more than one resolved path, pathFilters
+	// returns a space-separated list of subpath/literal clauses. A
+	// plain (allow OPS clauses...) rule treats them as match-any by
+	// default, but inside (require-all ...) they become match-all —
+	// and no single file is in all subpaths at once, so the rule
+	// never fires. Wrap in (require-any ...) for the
+	// issue-extension branch so the filters stay match-any.
+	extFilter := filter
+	if len(resolved) > 1 {
+		extFilter = "(require-any " + filter + ")"
+	}
 	result := []string{fmt.Sprintf("(allow %s %s)", ops, filter)}
 	for _, class := range r.extClasses {
 		result = append(result, fmt.Sprintf(
 			`(allow file-issue-extension (require-all (extension-class "%s") %s))`,
-			class, filter))
+			class, extFilter))
 	}
 	return result
 }

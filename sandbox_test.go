@@ -279,6 +279,41 @@ func TestBuildProfile_ReadWrite(t *testing.T) {
 	}
 }
 
+// TestBuildProfile_ReadWriteMultiplePaths verifies the
+// file-issue-extension rule wraps the path filters in (require-any
+// ...) when there are multiple paths. Without the wrapper,
+// (require-all ...) ANDs the subpath filters and the rule never
+// fires for any file (a file can't be in two subpaths at once).
+func TestBuildProfile_ReadWriteMultiplePaths(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS only")
+	}
+	dirA, _ := os.MkdirTemp("", "seatbelt-multi-a-*")
+	defer os.RemoveAll(dirA)
+	dirB, _ := os.MkdirTemp("", "seatbelt-multi-b-*")
+	defer os.RemoveAll(dirB)
+
+	profile, err := seatbelt.BuildProfile(
+		seatbelt.WithoutMinimal(),
+		seatbelt.Import("bsd.sb"),
+		seatbelt.ReadWrite(dirA, dirB),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := profile.String()
+
+	// The issue-extension allow must wrap subpath filters in
+	// require-any so the require-all only combines the extension-
+	// class with the path-match, not with all paths simultaneously.
+	if !strings.Contains(s, "(require-any") {
+		t.Fatalf("expected (require-any ...) wrapping multi-path filters, got:\n%s", s)
+	}
+	if strings.Contains(s, "(require-all (extension-class \"com.apple.app-sandbox.read-write\") (subpath") {
+		t.Fatalf("require-all must not chain multiple subpath clauses directly, got:\n%s", s)
+	}
+}
+
 func TestBuildProfile_Custom(t *testing.T) {
 	profile, err := seatbelt.BuildProfile(
 		seatbelt.WithoutMinimal(),
