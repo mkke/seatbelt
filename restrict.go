@@ -1,10 +1,12 @@
 package seatbelt
 
 import (
+	"errors"
 	"os"
 	"os/signal"
 	"runtime"
 	"syscall"
+	"time"
 )
 
 const (
@@ -131,11 +133,27 @@ func Release() {
 }
 
 // forwardSignals forwards SIGINT, SIGTERM, and SIGHUP to the child process.
+// It exits once child.Signal reports os.ErrProcessDone, which happens after
+// the parent has waited on the child.
 func forwardSignals(child *os.Process) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	for sig := range sigCh {
-		child.Signal(sig)
+	defer signal.Stop(sigCh)
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case sig := <-sigCh:
+			if err := child.Signal(sig); errors.Is(err, os.ErrProcessDone) {
+				return
+			}
+		case <-ticker.C:
+			if err := child.Signal(syscall.Signal(0)); errors.Is(err, os.ErrProcessDone) {
+				return
+			}
+		}
 	}
 }
 
